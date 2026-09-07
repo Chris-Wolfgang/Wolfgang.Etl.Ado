@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Data;
 using System.Threading;
 using System.Threading.Tasks;
@@ -57,24 +57,48 @@ public sealed record DbExtractorOptions
 
 
     /// <summary>
-    /// Gets the server-side row offset for paging. Defaults to <see langword="null"/> (no paging).
+    /// Rows per round-trip. Setting this makes the extractor walk the result set one page at a
+    /// time; leaving it unset issues a single query.
     /// </summary>
     /// <remarks>
-    /// The property itself stays <see langword="null"/> unless set; when paging is active an
-    /// unset offset is treated as <c>0</c>. Paging is switched on by <see cref="ServerLimit"/>,
-    /// so an offset with no limit throws — no page size can be inferred.
+    /// <para>
+    /// Paging is transport tuning, not a row filter: <c>SkipItemCount</c> and
+    /// <c>MaximumItemCount</c> decide which rows are yielded and yield the same rows either way.
+    /// What changes is the number of round-trips and the work the server does per query.
+    /// </para>
+    /// <para>
+    /// Requires <see cref="PagingClauseTemplate"/> — paging syntax is dialect-specific and no
+    /// portable form exists, so a page size without a template throws.
+    /// </para>
+    /// <para>
+    /// Paging costs more total server work, not less: <c>OFFSET n</c> is not a seek, so walking a
+    /// table of <c>N</c> rows scans roughly <c>N² / (2 × pageSize)</c> rows. What it buys is
+    /// bounded per-query work, shorter transactions and resumability. See
+    /// <see cref="DbExtractor{TRecord}.PageSize"/> for the full cost note.
+    /// </para>
     /// </remarks>
+    public int? PageSize { get; init; }
+
+
+
+    /// <summary>Rows to skip before the first yielded row, expressed as a server-side offset.</summary>
+    /// <remarks>
+    /// Superseded by <c>SkipItemCount</c>, which this is applied to — the two were always the same
+    /// idea. When a paging template is set the skip is pushed into the query's offset, so the
+    /// skipped rows are never fetched.
+    /// </remarks>
+    [Obsolete("Use SkipItemCount on the extractor instead. ServerOffset is applied to it and will be removed in a future release.")]
     public long? ServerOffset { get; init; }
 
 
 
-    /// <summary>
-    /// Gets the server-side row limit for paging. Defaults to <see langword="null"/> (no paging).
-    /// </summary>
+    /// <summary>Rows per round-trip.</summary>
     /// <remarks>
-    /// Setting this switches server-side paging on. An unset <see cref="ServerOffset"/> is then
-    /// treated as <c>0</c>, though the property itself remains <see langword="null"/>.
+    /// Superseded by <see cref="PageSize"/>, which takes precedence when both are set. The name
+    /// changed because the meaning did: this is the size of each round-trip, not a cap on the
+    /// total number of rows returned — use <c>MaximumItemCount</c> for the total.
     /// </remarks>
+    [Obsolete("Use PageSize instead. ServerLimit is applied to it and will be removed in a future release. Note the meaning changed: this is rows per round-trip, not a cap on the total — use MaximumItemCount for that.")]
     public long? ServerLimit { get; init; }
 
 

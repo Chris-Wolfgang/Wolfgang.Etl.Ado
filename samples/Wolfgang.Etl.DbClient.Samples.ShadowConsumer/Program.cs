@@ -1,4 +1,4 @@
-// Shadow-testing consumer — realistic DbClient workload for #130.
+﻿// Shadow-testing consumer — realistic DbClient workload for #130.
 //
 // Scenario: a paged extract-transform-load loop. 100k rows in a source
 // SQLite table, paged out 1k at a time via server-side paging on the
@@ -72,36 +72,50 @@ var sw = Stopwatch.StartNew();
 long extracted = 0;
 long loaded = 0;
 
-for (long offset = 0; offset < totalRows; offset += pageSize)
+// One extractor walks the whole table: PageSize is the round-trip size and the extractor
+// advances the offset itself. This used to be a caller-written for-loop rebuilding an extractor
+// per page — when the sample and the tests both hand-roll the same loop, it belongs in the
+// library. See docs/adr/0002-skip-max-and-paging.md.
+var extractor = new DbExtractor<SourceWidget>
+(
+    src,
+    "SELECT id AS Id, name AS Name, price AS Price FROM widget ORDER BY id"
+)
 {
-    var extractor = new DbExtractor<SourceWidget>
-    (
-        src,
-        "SELECT id AS Id, name AS Name, price AS Price FROM widget ORDER BY id"
-    )
-    {
-        // The source here is SQLite. Paging syntax is dialect-specific and the library no
-        // longer guesses one, so the dialect has to be named.
-        PagingClauseTemplate = PagingClauseTemplates.Sqlite,
-        ServerOffset = offset,
-        ServerLimit = pageSize,
-    };
+    // The source here is SQLite. Paging syntax is dialect-specific and the library does not
+    // guess one, so the dialect has to be named.
+    PagingClauseTemplate = PagingClauseTemplates.Sqlite,
+    PageSize = pageSize,
+};
 
-    var page = new List<DestWidget>(pageSize);
-    await foreach (var s in extractor.ExtractAsync())
+var loader = new DbLoader<DestWidget>
+(
+    dest,
+    "INSERT INTO widget_projected (id, upper_name, price) VALUES (@Id, @UpperName, @Price)"
+)
+{
+    InsertBatchSize = batchSize,
+};
+
+var page = new List<DestWidget>(pageSize);
+
+await foreach (var s in extractor.ExtractAsync())
+{
+    page.Add(new DestWidget { Id = s.Id, UpperName = s.Name.ToUpperInvariant(), Price = s.Price });
+    extracted++;
+
+    // Load in batches of the same size, so the allocation profile stays comparable to the
+    // per-page loop this replaced.
+    if (page.Count == pageSize)
     {
-        page.Add(new DestWidget { Id = s.Id, UpperName = s.Name.ToUpperInvariant(), Price = s.Price });
-        extracted++;
+        await loader.LoadAsync(AsAsync(page));
+        loaded += page.Count;
+        page.Clear();
     }
+}
 
-    var loader = new DbLoader<DestWidget>
-    (
-        dest,
-        "INSERT INTO widget_projected (id, upper_name, price) VALUES (@Id, @UpperName, @Price)"
-    )
-    {
-        InsertBatchSize = batchSize,
-    };
+if (page.Count > 0)
+{
     await loader.LoadAsync(AsAsync(page));
     loaded += page.Count;
 }

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Data.Common;
@@ -78,6 +78,9 @@ public class DbExtractor<TRecord> : ExtractorBase<TRecord, DbReport>
     private readonly ILogger _logger;
     private readonly Stopwatch _stopwatch = new();
     private int? _totalItemCount;
+
+
+    private int? _pageSize;
 
 
 
@@ -586,32 +589,115 @@ public class DbExtractor<TRecord> : ExtractorBase<TRecord, DbReport>
 
 
     /// <summary>
-    /// When <see cref="ServerLimit"/> is set, the extractor appends
-    /// <see cref="PagingClauseTemplate"/> to the command text before sending it, using this
-    /// offset — or <c>0</c> when this is unset. Default <see langword="null"/> disables
-    /// server-side paging (the v0.4.0 behavior — the full result set comes
-    /// back and <c>SkipItemCount</c>/<c>MaximumItemCount</c> filter
-    /// client-side).
+    /// Rows per round-trip. Setting this makes the extractor walk the result set one page at a
+    /// time; leaving it unset issues a single query.
     /// </summary>
     /// <remarks>
     /// <para>
-    /// Use server-side paging for very large tables where streaming
-    /// everything to the client is wasteful. SQL Server requires an
-    /// <c>ORDER BY</c> in the command text for paging to be deterministic;
-    /// SQLite, PostgreSQL, and MySQL don't require it but you should still
-    /// include one — without a stable order, page contents drift.
+    /// Paging is <b>transport tuning</b>, not a row filter. <c>SkipItemCount</c> and
+    /// <c>MaximumItemCount</c> decide which rows are yielded, and they yield the same rows
+    /// whether or not this is set. What changes is the number of round-trips and how much work
+    /// the server does per query.
     /// </para>
     /// <para>
-    /// Defaults to <c>0</c>. Paging is switched on by <see cref="ServerLimit"/>; an offset with no limit throws, since no page size can be inferred.
+    /// Requires <see cref="PagingClauseTemplate"/>, because paging syntax is dialect-specific and
+    /// no portable form exists. A page size without a template throws
+    /// <see cref="InvalidOperationException"/> rather than silently running unpaged.
+    /// </para>
+    /// <para>
+    /// <b>Paging costs more total server work, not less.</b> <c>OFFSET n</c> is not a seek — most
+    /// engines produce the rows in order and discard the first <c>n</c> — so a page at offset
+    /// <c>n</c> costs O(n + pageSize), and walking a table of <c>N</c> rows scans roughly
+    /// <c>N² / (2 × pageSize)</c> rows in total. A larger page reduces that linearly. What paging
+    /// buys is bounded per-query work, shorter transactions and resumability, not less work.
+    /// </para>
+    /// <para>
+    /// <b>Page contents drift under concurrent writes.</b> Rows inserted or deleted between pages
+    /// shift the window, so rows can be missed or returned twice even with an <c>ORDER BY</c>.
+    /// SQL Server requires an <c>ORDER BY</c> for paging to be deterministic at all; the other
+    /// engines do not require one, but you should still supply one.
     /// </para>
     /// </remarks>
-    public long? ServerOffset { get; [Obsolete("Configure ServerOffset through DbExtractorOptions passed to the constructor instead. This setter will be removed in a future release.")] set; }
+    /// <exception cref="ArgumentOutOfRangeException">The specified value is less than 1.</exception>
+    public int? PageSize
+    {
+        get => _pageSize;
+        set
+        {
+            if (value.HasValue && value.Value < 1)
+            {
+                throw new ArgumentOutOfRangeException(nameof(value), "PageSize cannot be less than 1.");
+            }
+
+            _pageSize = value;
+        }
+    }
 
 
 
-    /// <summary>Page size in rows. See <see cref="ServerOffset"/>.</summary>
-    /// <remarks>Setting this switches server-side paging on. <see cref="ServerOffset"/> defaults to <c>0</c> when not set.</remarks>
-    public long? ServerLimit { get; [Obsolete("Configure ServerLimit through DbExtractorOptions passed to the constructor instead. This setter will be removed in a future release.")] set; }
+    /// <summary>Rows to skip before the first yielded row, expressed as a server-side offset.</summary>
+    /// <remarks>
+    /// Superseded by <c>SkipItemCount</c>, which this property forwards to — the two were
+    /// always the same idea, so there is one value rather than two that can disagree. When a
+    /// paging template is set the skip is pushed into the query's offset, so the skipped rows are
+    /// never fetched.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// The specified value does not fit in an <see cref="int"/>.
+    /// </exception>
+    [Obsolete("Use SkipItemCount instead. ServerOffset forwards to it and will be removed in a future release.")]
+    public long? ServerOffset
+    {
+        get => SkipItemCount;
+        set => SkipItemCount = value.HasValue ? ToRowCount(value.Value, nameof(ServerOffset)) : 0;
+    }
+
+
+
+    /// <summary>Rows per round-trip.</summary>
+    /// <remarks>
+    /// Superseded by <see cref="PageSize"/>, which this property forwards to. The name changed
+    /// because the meaning did: this is the size of each round-trip, not a cap on the total number
+    /// of rows returned. Use <c>MaximumItemCount</c> for the total.
+    /// </remarks>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// The specified value does not fit in an <see cref="int"/>.
+    /// </exception>
+    [Obsolete("Use PageSize instead. ServerLimit forwards to it and will be removed in a future release. Note the meaning changed: this is rows per round-trip, not a cap on the total — use MaximumItemCount for that.")]
+    public long? ServerLimit
+    {
+        get => PageSize;
+        set => PageSize = value.HasValue ? ToRowCount(value.Value, nameof(ServerLimit)) : (int?)null;
+    }
+
+
+
+    /// <summary>
+    /// Narrows a <see cref="long"/> row count from an obsolete property to the <see cref="int"/>
+    /// the base class uses, refusing to truncate silently.
+    /// </summary>
+    /// <param name="value">The row count to narrow.</param>
+    /// <param name="propertyName">The obsolete property the value came from, for the message.</param>
+    /// <returns>The value as an <see cref="int"/>.</returns>
+    /// <exception cref="ArgumentOutOfRangeException">
+    /// <paramref name="value"/> does not fit in an <see cref="int"/>.
+    /// </exception>
+    private static int ToRowCount(long value, string propertyName)
+    {
+        if (value < int.MinValue || value > int.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException
+            (
+                nameof(value),
+                value,
+                $"{propertyName} does not fit in an Int32 and cannot be forwarded. Row counts are " +
+                "Int32-wide; see Chris-Wolfgang/ETL-Abstractions#454."
+            );
+        }
+
+        return (int)value;
+    }
+
 
 
 
@@ -774,88 +860,185 @@ public class DbExtractor<TRecord> : ExtractorBase<TRecord, DbReport>
                 await DbSchemaValidator.ValidateAsync<TRecord>(_connection, token).ConfigureAwait(false);
             }
 
-            ApplyServerPaging(_commandText, Parameters ?? _dynamicParameters, out var commandText, out var param);
+            var param = Parameters ?? _dynamicParameters;
+
+            // The TEMPLATE is the switch. It names the dialect, and since there is no portable
+            // paging syntax there is nothing to emit without one. PageSize then decides whether
+            // that clause drives a single query or a walk across pages.
+            var templateChosen = !string.IsNullOrWhiteSpace(PagingClauseTemplate);
+
+            EnsurePagingConfigurationValid(templateChosen);
+
+            // A template with nothing to bound is not worth a clause: it would send
+            // "FETCH NEXT 2147483647", which nothing here has verified every engine accepts.
+            var paging = templateChosen
+                && (SkipItemCount > 0 || MaximumItemCount != int.MaxValue || PageSize.HasValue);
+
+            // With a template in hand the skip belongs in the query's offset, so the rows are
+            // never fetched at all. The client-side skip below must then not run, or they would
+            // be skipped twice.
+            var serverSideSkip = paging && SkipItemCount > 0;
+
+            if (paging)
+            {
+                // Runs ONCE, before the first page. Per page it would fail on page two against
+                // paging's own parameter names, which page one just added.
+                EnsurePagingParametersNotAlreadySupplied();
+                param ??= new DynamicParameters();
+            }
+            else if (SkipItemCount > 0)
+            {
+                LogSkipWithoutPaging();
+            }
 
             if (TotalCountQuery != null)
             {
                 _totalItemCount = await TotalCountQuery(token).ConfigureAwait(false);
             }
 
+            if (serverSideSkip)
+            {
+                // The rows genuinely were skipped, just not by us. Leaving the counter at zero
+                // would silently change an observable the moment the skip moved server-side.
+                for (var skipped = 0; skipped < SkipItemCount; skipped++)
+                {
+                    IncrementCurrentSkippedItemCount();
+                }
+            }
+
+            var commandText = paging ? _commandText + " " + PagingClauseTemplate : _commandText;
+
+            // rowsReceived counts rows the READER produced, including ones that failed to parse.
+            // CurrentItemCount counts rows YIELDED. The offset and the short-page test run off
+            // the first; the maximum clamp runs off the second. Conflating them is the whole bug:
+            // advancing the offset by rows yielded re-fetches every row that failed to parse and
+            // duplicates the good rows behind them, and testing the short page against rows
+            // yielded ends the walk at the first page containing one.
+            long rowsReceived = 0;
             long rowIndex = 0;
 
-            // The reader is driven with a manual ReadAsync loop, and row mapping
-            // goes through a standalone Dapper row-parser delegate, rather than
-            // Dapper's own QueryUnbufferedAsync<T> IAsyncEnumerable. That matters:
-            // QueryUnbufferedAsync's read-and-map loop lives inside ONE compiler-
-            // generated async-iterator state machine. When mapping throws mid-loop,
-            // the iterator's finally block runs and the state machine transitions
-            // to "finished" — so even catching the exception at the call site,
-            // the NEXT MoveNextAsync just returns false. Skip would silently
-            // truncate the result set after the first bad row instead of
-            // continuing past it. Reading via our own loop keeps ReadAsync's
-            // cursor alive across a caught mapping failure, so Skip actually
-            // skips-and-continues.
-            var command = new CommandDefinition(commandText, param, _transaction, CommandTimeoutSeconds, CommandType, cancellationToken: token);
-            using var reader = await _connection.ExecuteReaderAsync(command).ConfigureAwait(false);
-            var parseRow = reader.GetRowParser<TRecord>();
-
-            while (await reader.ReadAsync(token).ConfigureAwait(false))
+            while (true)
             {
                 token.ThrowIfCancellationRequested();
 
-                TRecord record;
-                try
+                long requestedLimit = 0;
+
+                if (paging)
                 {
-                    record = parseRow(reader);
-                }
-                catch (System.Data.DataException ex)
-                {
-                    // Scoped to DataException — the type Dapper wraps row-materialization
-                    // failures in (e.g. "Error parsing column N") — so ErrorPolicy only ever
-                    // sees per-row failures. Catching every exception type here would also
-                    // catch connection-level failures (a dropped connection, a syntax error
-                    // surfacing lazily); those aren't per-row, and ReadAsync would likely keep
-                    // throwing the same fault on every subsequent call, so routing them
-                    // through ItemErrorAction.Skip would spin the loop instead of terminating.
-                    rowIndex++;
-                    var action = HandleItemError
-                    (
-                        new ItemErrorContext
-                        (
-                            rowIndex,
-                            ex,
-                            rawContent: null
-                        )
-                    );
-                    if (action == ItemErrorAction.Abort)
+                    // MaximumItemCount defaults to int.MaxValue, so this is "all the rest" when
+                    // the caller set no maximum. Computed in long: the offset can exceed int once
+                    // a skip is added even though both operands fit.
+                    var remaining = (long)MaximumItemCount - CurrentItemCount;
+                    if (remaining <= 0)
                     {
-                        System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
+                        break;
                     }
-                    // ItemErrorAction.Skip — HandleItemError already incremented
-                    // the error-item counter on the base. Log and continue.
-                    LogDebugRowErrorSkipped(rowIndex, ex);
-                    continue;
+
+                    requestedLimit = PageSize.HasValue
+                        ? Math.Min((long)PageSize.Value, remaining)
+                        : remaining;
+
+                    SetPagingParameters(param!, (long)SkipItemCount + rowsReceived, requestedLimit);
                 }
 
-                rowIndex++;
+                // The reader is driven with a manual ReadAsync loop, and row mapping
+                // goes through a standalone Dapper row-parser delegate, rather than
+                // Dapper's own QueryUnbufferedAsync<T> IAsyncEnumerable. That matters:
+                // QueryUnbufferedAsync's read-and-map loop lives inside ONE compiler-
+                // generated async-iterator state machine. When mapping throws mid-loop,
+                // the iterator's finally block runs and the state machine transitions
+                // to "finished" — so even catching the exception at the call site,
+                // the NEXT MoveNextAsync just returns false. Skip would silently
+                // truncate the result set after the first bad row instead of
+                // continuing past it. Reading via our own loop keeps ReadAsync's
+                // cursor alive across a caught mapping failure, so Skip actually
+                // skips-and-continues.
+                var command = new CommandDefinition(commandText, param, _transaction, CommandTimeoutSeconds, CommandType, cancellationToken: token);
 
-                if (rowIndex <= SkipItemCount)
+                long rowsThisPage = 0;
+
+                using (var reader = await _connection.ExecuteReaderAsync(command).ConfigureAwait(false))
                 {
-                    IncrementCurrentSkippedItemCount();
-                    LogDebugRowSkipped(rowIndex);
-                    continue;
+                    var parseRow = reader.GetRowParser<TRecord>();
+
+                    while (await reader.ReadAsync(token).ConfigureAwait(false))
+                    {
+                        token.ThrowIfCancellationRequested();
+
+                        // Counted before anything can reject the row, so a row that fails to parse
+                        // still advances the offset. It occupied a position in the source and the
+                        // next page must start after it.
+                        rowIndex++;
+                        rowsThisPage++;
+
+                        TRecord record;
+                        try
+                        {
+                            record = parseRow(reader);
+                        }
+                        catch (System.Data.DataException ex)
+                        {
+                            // Scoped to DataException — the type Dapper wraps row-materialization
+                            // failures in (e.g. "Error parsing column N") — so ErrorPolicy only ever
+                            // sees per-row failures. Catching every exception type here would also
+                            // catch connection-level failures (a dropped connection, a syntax error
+                            // surfacing lazily); those aren't per-row, and ReadAsync would likely keep
+                            // throwing the same fault on every subsequent call, so routing them
+                            // through ItemErrorAction.Skip would spin the loop instead of terminating.
+                            var action = HandleItemError
+                            (
+                                new ItemErrorContext
+                                (
+                                    rowIndex,
+                                    ex,
+                                    rawContent: null
+                                )
+                            );
+                            if (action == ItemErrorAction.Abort)
+                            {
+                                System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw();
+                            }
+                            // ItemErrorAction.Skip — HandleItemError already incremented
+                            // the error-item counter on the base. Log and continue.
+                            LogDebugRowErrorSkipped(rowIndex, ex);
+                            continue;
+                        }
+
+                        // Only when the database did not do the skipping for us.
+                        if (!serverSideSkip && rowIndex <= SkipItemCount)
+                        {
+                            IncrementCurrentSkippedItemCount();
+                            LogDebugRowSkipped(rowIndex);
+                            continue;
+                        }
+
+                        if (CurrentItemCount >= MaximumItemCount)
+                        {
+                            LogDebugMaxReached();
+                            LogExtractionCompleted();
+                            yield break;
+                        }
+
+                        LogDebugRowExtracted(rowIndex);
+                        IncrementCurrentItemCount();
+                        yield return record;
+                    }
                 }
 
-                if (CurrentItemCount >= MaximumItemCount)
+                if (!paging)
                 {
-                    LogDebugMaxReached();
-                    LogExtractionCompleted();
-                    yield break;
+                    break;
                 }
 
-                LogDebugRowExtracted(rowIndex);
-                IncrementCurrentItemCount();
-                yield return record;
+                rowsReceived += rowsThisPage;
+
+                // A page that came back short of what it asked for is the last one. Compared
+                // against rows RECEIVED so a page full of unparseable rows does not read as
+                // exhaustion.
+                if (rowsThisPage < requestedLimit)
+                {
+                    break;
+                }
             }
 
             LogExtractionCompleted();
@@ -899,27 +1082,27 @@ public class DbExtractor<TRecord> : ExtractorBase<TRecord, DbReport>
     }
 
     /// <summary>
-    /// Verifies a paging dialect was chosen before server-side paging is applied.
+    /// Verifies the paging knobs are coherent before the first query goes out.
     /// </summary>
+    /// <param name="templateChosen">Whether a paging dialect has been named.</param>
     /// <exception cref="InvalidOperationException">
-    /// Paging is active but <see cref="PagingClauseTemplate"/> is
+    /// <see cref="PageSize"/> is set but <see cref="PagingClauseTemplate"/> is
     /// <see cref="PagingClauseTemplates.None"/>.
     /// </exception>
-    private void EnsurePagingClauseTemplateChosen()
+    private void EnsurePagingConfigurationValid(bool templateChosen)
     {
-        if (!string.IsNullOrWhiteSpace(PagingClauseTemplate))
+        if (!PageSize.HasValue || templateChosen)
         {
             return;
         }
 
         throw new InvalidOperationException
         (
-            "Server-side paging requires PagingClauseTemplate to be set, because paging syntax " +
-            "is dialect-specific and no portable form exists. Choose a preset from " +
+            "PageSize was set without PagingClauseTemplate, so no paging clause can be emitted — " +
+            "paging syntax is dialect-specific and no portable form exists. Choose a preset from " +
             "PagingClauseTemplates (for example PagingClauseTemplates.SqlServer, .PostgreSql, " +
-            ".MySql, .Sqlite, .Oracle or .Db2), or supply your own clause referencing " +
-            "@PageOffset and @PageLimit. To disable paging instead, clear ServerOffset and " +
-            "ServerLimit."
+            ".MySql, .Sqlite, .Oracle or .Db2), or supply your own clause referencing @PageOffset " +
+            "and @PageLimit. To run unpaged instead, clear PageSize."
         );
     }
 
@@ -929,10 +1112,14 @@ public class DbExtractor<TRecord> : ExtractorBase<TRecord, DbReport>
     /// Rejects a caller-supplied parameter whose name server-side paging also generates.
     /// </summary>
     /// <remarks>
-    /// This cannot live inside either branch of <see cref="ApplyServerPaging"/>.
+    /// It cannot run per page: page one adds the paging parameters, so page two would find them
+    /// already present and reject the query the extractor itself configured. It runs once, before
+    /// the first page.
+    /// <para>
     /// <c>EtlParameterSet</c> can detect a collision itself, but the <c>DynamicParameters</c>
     /// branch cannot — its <c>Add</c> silently overwrites, so the caller's value would disappear
     /// without a word.
+    /// </para>
     /// <para>
     /// Two routes can carry a caller's parameters and both are checked: the constructor
     /// dictionary, and the obsolete <see cref="Parameters"/> property — which takes
@@ -984,8 +1171,8 @@ public class DbExtractor<TRecord> : ExtractorBase<TRecord, DbReport>
                 (
                     $"Parameter '{generated}' was supplied by the caller and is also generated by " +
                     "server-side paging, so it cannot be applied twice. Either stop supplying " +
-                    $"'{generated}' and let paging provide it, or clear ServerOffset and " +
-                    "ServerLimit and page through the command text yourself."
+                    $"'{generated}' and let paging provide it, or clear PagingClauseTemplate " +
+                    "and page through the command text yourself."
                 );
             }
         }
@@ -993,73 +1180,28 @@ public class DbExtractor<TRecord> : ExtractorBase<TRecord, DbReport>
 
 
     /// <summary>
-    /// If <see cref="ServerLimit"/> is set, append <see cref="PagingClauseTemplate"/> to <paramref name="commandText"/>
-    /// (returned via <paramref name="pagedCommandText"/>) and add
-    /// <c>@PageOffset</c> / <c>@PageLimit</c> to the parameter set (returned
-    /// via <paramref name="pagedParam"/>). Otherwise returns the inputs
-    /// unchanged.
+    /// Points the paging parameters at one page. Called once per round-trip, so it overwrites
+    /// rather than accumulates: both parameter shapes replace an existing value by name.
     /// </summary>
-    /// <remarks>
-    /// out parameters instead of a tuple — net462 doesn't ship
-    /// <c>System.ValueTuple</c> in the base targeting pack and we avoid the
-    /// extra package reference.
-    /// </remarks>
-    /// <param name="commandText">The command text to page.</param>
-    /// <param name="param">The parameter set to add the paging parameters to, or <c>null</c>.</param>
-    /// <param name="pagedCommandText">The command text with the paging clause appended.</param>
-    /// <param name="pagedParam">The parameter set including the paging parameters.</param>
-    /// <exception cref="InvalidOperationException">
-    /// The caller's parameter dictionary already contains <c>@PageOffset</c> or <c>@PageLimit</c>,
-    /// which server-side paging also generates. Emitting both would duplicate the name, and
-    /// silently preferring one would discard either the caller's value or the paging.
-    /// </exception>
-    private void ApplyServerPaging(string commandText, SqlMapper.IDynamicParameters? param, out string pagedCommandText, out SqlMapper.IDynamicParameters? pagedParam)
+    /// <param name="param">The parameter set carrying the query's parameters.</param>
+    /// <param name="offset">Rows for the database to pass over before the first returned row.</param>
+    /// <param name="limit">Rows this round-trip should return at most.</param>
+    private static void SetPagingParameters(SqlMapper.IDynamicParameters param, long offset, long limit)
     {
-        if (!ServerLimit.HasValue)
-        {
-            // An offset with no limit is the mirror of the bug this default fixes: the caller
-            // plainly wants paging, and no limit can be inferred (every template references
-            // @PageLimit). Silently returning every row from the top would ignore what they asked
-            // for, so say so instead.
-            if (ServerOffset.HasValue)
-            {
-                throw new InvalidOperationException
-                (
-                    "ServerOffset was set without ServerLimit, so server-side paging cannot be " +
-                    "applied — a page size is required and cannot be inferred. Set ServerLimit " +
-                    "to the number of rows per page, or clear ServerOffset."
-                );
-            }
-
-            pagedCommandText = commandText;
-            pagedParam = param;
-            return;
-        }
-
-        // ServerLimit alone is enough: an unspecified offset can only mean "start at the top".
-        var serverOffset = ServerOffset ?? 0L;
-
-        EnsurePagingClauseTemplateChosen();
-        EnsurePagingParametersNotAlreadySupplied();
-
         // Both parameter shapes accept additions, by different methods.
         switch (param)
         {
             case EtlParameterSet set:
-                set.Add("@PageOffset", serverOffset);
-                set.Add("@PageLimit", ServerLimit.Value);
-                pagedParam = set;
+                set.Add("@PageOffset", offset);
+                set.Add("@PageLimit", limit);
                 break;
 
             default:
-                var dynamic = param as DynamicParameters ?? new DynamicParameters();
-                dynamic.Add("@PageOffset", serverOffset);
-                dynamic.Add("@PageLimit", ServerLimit.Value);
-                pagedParam = dynamic;
+                var dynamic = (DynamicParameters)param;
+                dynamic.Add("@PageOffset", offset);
+                dynamic.Add("@PageLimit", limit);
                 break;
         }
-
-        pagedCommandText = commandText + " " + PagingClauseTemplate;
     }
 
 
@@ -1171,6 +1313,23 @@ public class DbExtractor<TRecord> : ExtractorBase<TRecord, DbReport>
 
 
 
+    private void LogSkipWithoutPaging()
+    {
+        if (_logger.IsEnabled(LogLevel.Warning))
+        {
+            _logger.LogWarning
+            (
+                "SkipItemCount={SkipItemCount} is being applied client-side: the database returns " +
+                "those rows and they are discarded on arrival. Set PagingClauseTemplate to your " +
+                "dialect (PagingClauseTemplates.SqlServer, .PostgreSql, .MySql, .Sqlite, .Oracle " +
+                "or .Db2) to push the skip into the query's offset so they are never fetched",
+                SkipItemCount
+            );
+        }
+    }
+
+
+
     private void LogDebugMaxReached()
     {
         if (_logger.IsEnabled(LogLevel.Debug))
@@ -1231,9 +1390,17 @@ public class DbExtractor<TRecord> : ExtractorBase<TRecord, DbReport>
         CommandType = options.CommandType;
         ManageConnection = options.ManageConnection;
         ValidateSchemaOnStart = options.ValidateSchemaOnStart;
-        ServerOffset = options.ServerOffset;
-        ServerLimit = options.ServerLimit;
         PagingClauseTemplate = options.PagingClauseTemplate;
+
+        // PageSize wins over the obsolete ServerLimit; ServerOffset lands on SkipItemCount,
+        // which is the same idea and now the only place it lives.
+        PageSize = options.PageSize
+            ?? (options.ServerLimit.HasValue ? ToRowCount(options.ServerLimit.Value, nameof(DbExtractorOptions.ServerLimit)) : (int?)null);
+
+        if (options.ServerOffset.HasValue)
+        {
+            SkipItemCount = ToRowCount(options.ServerOffset.Value, nameof(DbExtractorOptions.ServerOffset));
+        }
         TotalCountQuery = options.TotalCountQuery;
 #pragma warning restore CS0618
     }
