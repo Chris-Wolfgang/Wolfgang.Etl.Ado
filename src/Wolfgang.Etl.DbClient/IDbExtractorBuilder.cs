@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Data;
 using System.Threading;
 using System.Threading.Tasks;
@@ -52,6 +52,39 @@ public interface IDbExtractorBuilder<T> : IEtlPipeline<T>
     /// </summary>
     /// <remarks>Defaults to <c>0</c>. Paging is switched on by <see cref="ServerLimit"/>; an offset with no limit throws, since no page size can be inferred.</remarks>
     IDbExtractorBuilder<T> ServerOffset(long? offset);
+
+
+    /// <summary>
+    /// Sets <see cref="DbExtractor{TRecord}.PageSize"/> — rows per round-trip.
+    /// </summary>
+    /// <param name="pageSize">Rows per round-trip, or <see langword="null"/> for a single query.</param>
+    /// <returns>The same builder, for chaining.</returns>
+    /// <remarks>
+    /// Transport tuning, not a row filter. Requires
+    /// <see cref="PagingClauseTemplate"/>; use <see cref="MaximumItemCount"/> to cap the total
+    /// number of rows returned.
+    /// </remarks>
+    IDbExtractorBuilder<T> PageSize(int? pageSize);
+
+
+    /// <summary>
+    /// Sets the number of rows to pass over before the first yielded row.
+    /// </summary>
+    /// <param name="skip">Rows to skip.</param>
+    /// <returns>The same builder, for chaining.</returns>
+    /// <remarks>
+    /// Pushed into the query's offset when <see cref="PagingClauseTemplate"/> is set, so the
+    /// skipped rows are never fetched; applied client-side otherwise.
+    /// </remarks>
+    IDbExtractorBuilder<T> SkipItemCount(int skip);
+
+
+    /// <summary>
+    /// Sets the maximum number of rows to yield.
+    /// </summary>
+    /// <param name="maximum">The maximum number of rows.</param>
+    /// <returns>The same builder, for chaining.</returns>
+    IDbExtractorBuilder<T> MaximumItemCount(int maximum);
 
 
     /// <summary>

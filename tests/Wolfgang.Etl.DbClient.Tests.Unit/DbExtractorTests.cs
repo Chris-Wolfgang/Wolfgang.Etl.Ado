@@ -1,4 +1,4 @@
-using Dapper;
+﻿using Dapper;
 using Microsoft.Data.Sqlite;
 using Wolfgang.Etl.ErrorPolicies;
 using Wolfgang.Etl.TestKit.Xunit;
@@ -611,8 +611,7 @@ public class DbExtractorTests
         using var conn = TestDb.CreateConnection();
         var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName FROM People");
 
-        Assert.Null(extractor.ServerOffset);
-        Assert.Null(extractor.ServerLimit);
+        Assert.Null(extractor.PageSize);
         // No dialect is assumed; see PagingClauseTemplates.None.
         Assert.Null(extractor.PagingClauseTemplate);
     }
@@ -620,15 +619,16 @@ public class DbExtractorTests
 
 
     [Fact]
-    public async Task ExtractAsync_with_ServerLimit_caps_rows_at_the_database()
+    public async Task ExtractAsync_with_a_template_and_no_PageSize_pushes_the_maximum_into_one_query()
     {
+        // Template without a page size is the single-query mode: the maximum goes into the
+        // clause, so the database never produces the other 15 rows.
         using var conn = await TestDb.CreateConnectionWithDataAsync(rowCount: 20);
 
         var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName, last_name AS LastName, age AS Age FROM People ORDER BY id")
         {
             PagingClauseTemplate = PagingClauseTemplates.Sqlite,
-            ServerOffset = 0,
-            ServerLimit = 5
+            MaximumItemCount = 5
         };
 
         var records = await extractor.ExtractAsync().ToListAsync();
@@ -641,20 +641,21 @@ public class DbExtractorTests
 
 
     [Fact]
-    public async Task ExtractAsync_with_ServerOffset_and_ServerLimit_returns_a_page()
+    public async Task ExtractAsync_with_a_template_pushes_SkipItemCount_into_the_offset()
     {
+        // The identity of the first row is the offset assertion: a skip applied client-side or
+        // not at all would start at First1, and a doubled skip would start at First21.
         using var conn = await TestDb.CreateConnectionWithDataAsync(rowCount: 20);
 
         var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName, last_name AS LastName, age AS Age FROM People ORDER BY id")
         {
             PagingClauseTemplate = PagingClauseTemplates.Sqlite,
-            ServerOffset = 10,
-            ServerLimit = 5
+            SkipItemCount = 10,
+            MaximumItemCount = 5
         };
 
         var records = await extractor.ExtractAsync().ToListAsync();
 
-        // Skipped 10, took 5 → First11..First15.
         Assert.Equal(5, records.Count);
         Assert.Equal("First11", records[0].FirstName);
         Assert.Equal("First15", records[4].FirstName);
@@ -663,17 +664,105 @@ public class DbExtractorTests
 
 
     [Fact]
-    public async Task ExtractAsync_when_paging_is_active_without_a_template_throws_and_names_the_fix()
+    public async Task ExtractAsync_when_the_skip_is_server_side_still_reports_it_as_skipped()
+    {
+        // The rows were skipped, just not by us. Leaving the counter at zero would silently
+        // change an observable the moment the skip moved into the query.
+        using var conn = await TestDb.CreateConnectionWithDataAsync(rowCount: 20);
+
+        var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName, last_name AS LastName, age AS Age FROM People ORDER BY id")
+        {
+            PagingClauseTemplate = PagingClauseTemplates.Sqlite,
+            SkipItemCount = 4,
+            MaximumItemCount = 2
+        };
+
+        await extractor.ExtractAsync().ToListAsync();
+
+        Assert.Equal(4, extractor.CurrentSkippedItemCount);
+    }
+
+
+
+    [Fact]
+    public async Task ExtractAsync_with_PageSize_walks_every_page_from_one_extractor()
+    {
+        // The ergonomics gap this closes: one extractor, no caller-written loop.
+        using var conn = await TestDb.CreateConnectionWithDataAsync(rowCount: 20);
+
+        var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName, last_name AS LastName, age AS Age FROM People ORDER BY id")
+        {
+            PagingClauseTemplate = PagingClauseTemplates.Sqlite,
+            PageSize = 3
+        };
+
+        var records = await extractor.ExtractAsync().ToListAsync();
+
+        Assert.Equal(20, records.Count);
+        Assert.Equal("First1", records[0].FirstName);
+        Assert.Equal("First20", records[19].FirstName);
+
+        // Every row exactly once — a mis-advanced offset would repeat or drop some.
+        Assert.Equal(20, records.Select(r => r.FirstName).Distinct(StringComparer.Ordinal).Count());
+    }
+
+
+
+    [Fact]
+    public async Task ExtractAsync_with_PageSize_and_a_maximum_stops_at_the_maximum()
+    {
+        // Page size 4 with a maximum of 10 is 4 + 4 + 2: the last page asks for only what is
+        // still needed rather than a full page that would be partly discarded.
+        using var conn = await TestDb.CreateConnectionWithDataAsync(rowCount: 20);
+
+        var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName, last_name AS LastName, age AS Age FROM People ORDER BY id")
+        {
+            PagingClauseTemplate = PagingClauseTemplates.Sqlite,
+            PageSize = 4,
+            MaximumItemCount = 10
+        };
+
+        var records = await extractor.ExtractAsync().ToListAsync();
+
+        Assert.Equal(10, records.Count);
+        Assert.Equal("First10", records[9].FirstName);
+    }
+
+
+
+    [Fact]
+    public async Task ExtractAsync_with_PageSize_and_a_skip_walks_from_the_skip_to_the_end()
+    {
+        using var conn = await TestDb.CreateConnectionWithDataAsync(rowCount: 20);
+
+        var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName, last_name AS LastName, age AS Age FROM People ORDER BY id")
+        {
+            PagingClauseTemplate = PagingClauseTemplates.Sqlite,
+            SkipItemCount = 15,
+            PageSize = 2
+        };
+
+        var records = await extractor.ExtractAsync().ToListAsync();
+
+        Assert.Equal(5, records.Count);
+        Assert.Equal("First16", records[0].FirstName);
+        Assert.Equal("First20", records[4].FirstName);
+    }
+
+
+
+    [Fact]
+    public async Task ExtractAsync_when_PageSize_is_set_without_a_template_throws_and_names_the_fix()
     {
         // The whole point of defaulting to None: without this the caller gets a raw provider
         // syntax error ("Incorrect syntax near 'LIMIT'" on SQL Server) instead of being told
-        // what to do. Assert the message actually carries the remedy.
+        // what to do. Silently running unpaged would be worse still — a surprise full-table
+        // scan that looks correct in development.
         using var conn = await TestDb.CreateConnectionWithDataAsync(rowCount: 5);
 
         var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName FROM People ORDER BY id")
         {
-            ServerOffset = 0,
-            ServerLimit = 2
+            PageSize = 2
         };
 
         var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
@@ -683,7 +772,7 @@ public class DbExtractorTests
 
         Assert.Contains("PagingClauseTemplate", ex.Message, StringComparison.Ordinal);
         Assert.Contains("PagingClauseTemplates", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("ServerOffset", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("PageSize", ex.Message, StringComparison.Ordinal);
     }
 
 
@@ -706,44 +795,95 @@ public class DbExtractorTests
 
 
     [Fact]
-    public async Task ExtractAsync_with_only_ServerOffset_throws_because_no_page_size_can_be_inferred()
+    public async Task ExtractAsync_with_a_template_but_nothing_to_bound_appends_no_clause()
     {
-        // Reversed: this used to return all 10 rows, silently ignoring the offset the caller
-        // asked for. An offset with no limit is the mirror of the limit-with-no-offset bug —
-        // the caller clearly wants paging, and no page size can be inferred.
-        using var conn = await TestDb.CreateConnectionWithDataAsync(rowCount: 10);
+        // Nothing to page: no skip, no maximum, no page size. Appending the clause would mean
+        // sending "LIMIT 2147483647", which nothing here has verified every engine accepts.
+        // If a clause were emitted with a bad limit this query would fail rather than return 5.
+        using var conn = await TestDb.CreateConnectionWithDataAsync(rowCount: 5);
 
         var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName, last_name AS LastName, age AS Age FROM People ORDER BY id")
         {
-            PagingClauseTemplate = PagingClauseTemplates.Sqlite,
-            ServerOffset = 5
+            PagingClauseTemplate = PagingClauseTemplates.Sqlite
         };
 
-        var ex = await Assert.ThrowsAsync<InvalidOperationException>(async () =>
-        {
-            await foreach (var _ in extractor.ExtractAsync()) { }
-        });
+        var records = await extractor.ExtractAsync().ToListAsync();
 
-        Assert.Contains("ServerLimit", ex.Message, StringComparison.Ordinal);
+        Assert.Equal(5, records.Count);
     }
 
 
 
     [Fact]
-    public async Task ExtractAsync_with_only_ServerLimit_pages_from_offset_zero()
+    public async Task ExtractAsync_without_a_template_still_applies_Skip_and_Max_client_side()
     {
-        using var conn = await TestDb.CreateConnectionWithDataAsync(rowCount: 10);
+        using var conn = await TestDb.CreateConnectionWithDataAsync(rowCount: 20);
 
         var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName, last_name AS LastName, age AS Age FROM People ORDER BY id")
         {
-            PagingClauseTemplate = PagingClauseTemplates.Sqlite,
-            ServerLimit = 3
+            SkipItemCount = 5,
+            MaximumItemCount = 3
         };
 
         var records = await extractor.ExtractAsync().ToListAsync();
 
         Assert.Equal(3, records.Count);
-        Assert.Equal("First1", records[0].FirstName);
+        Assert.Equal("First6", records[0].FirstName);
+        Assert.Equal(5, extractor.CurrentSkippedItemCount);
+    }
+
+
+
+    [Fact]
+    public void ServerOffset_forwards_to_SkipItemCount()
+    {
+        using var conn = TestDb.CreateConnection();
+        var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName FROM People");
+
+        extractor.ServerOffset = 7;
+        Assert.Equal(7, extractor.SkipItemCount);
+
+        extractor.SkipItemCount = 9;
+        Assert.Equal(9L, extractor.ServerOffset);
+    }
+
+
+
+    [Fact]
+    public void ServerLimit_forwards_to_PageSize()
+    {
+        using var conn = TestDb.CreateConnection();
+        var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName FROM People");
+
+        extractor.ServerLimit = 25;
+        Assert.Equal(25, extractor.PageSize);
+
+        extractor.PageSize = 40;
+        Assert.Equal(40L, extractor.ServerLimit);
+    }
+
+
+
+    [Fact]
+    public void ServerOffset_that_does_not_fit_in_an_int_throws_rather_than_truncating()
+    {
+        // Row counts are Int32-wide on the base; a silent truncation here would turn an offset
+        // of 4294967296 into 0 and quietly return the wrong rows.
+        using var conn = TestDb.CreateConnection();
+        var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName FROM People");
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => extractor.ServerOffset = (long)int.MaxValue + 1);
+    }
+
+
+
+    [Fact]
+    public void PageSize_below_one_throws()
+    {
+        using var conn = TestDb.CreateConnection();
+        var extractor = new DbExtractor<PersonRecord>(conn, "SELECT first_name AS FirstName FROM People");
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => extractor.PageSize = 0);
     }
 
 

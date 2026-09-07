@@ -1,4 +1,4 @@
-# Changelog
+﻿# Changelog
 
 All notable changes to this project will be documented in this file.
 
@@ -9,11 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DbExtractor.PageSize` / `DbExtractorOptions.PageSize` — rows per round-trip. A single extractor
+  now walks the whole result set instead of yielding one page, so callers no longer write the page
+  loop themselves ([#410](https://github.com/Chris-Wolfgang/Etl-DbClient/issues/410),
+  [#394](https://github.com/Chris-Wolfgang/Etl-DbClient/issues/394)).
+- `IDbExtractorBuilder.PageSize()`, `.SkipItemCount()` and `.MaximumItemCount()`, so the builder can
+  express the row contract as well as the transport tuning.
+- [ADR-0002](docs/adr/0002-skip-max-and-paging.md) records the model: `SkipItemCount` and
+  `MaximumItemCount` are the contract, `PagingClauseTemplate` and `PageSize` are transport tuning.
+
 ### Changed
+
+- **`PagingClauseTemplate` is now the switch that activates paging.** Left at
+  `PagingClauseTemplates.None` the command runs unchanged; set, the paging clause is applied. With a
+  template and no `PageSize`, the skip and the maximum are pushed into a **single** query — the
+  cheapest path, since it pays the offset once instead of once per page.
+- **`SkipItemCount` is pushed into the query's offset when a template is set**, so the skipped rows
+  are never fetched instead of being fetched and discarded on arrival
+  ([#398](https://github.com/Chris-Wolfgang/Etl-DbClient/issues/398)). Without a template the
+  client-side skip stays, and now logs a warning naming the faster route.
+- A page never asks for more than is still needed: the requested limit is
+  `min(PageSize, MaximumItemCount - rowsYielded)`.
+- `SkipItemCount` with a template is reported through `CurrentSkippedItemCount` as before — the rows
+  were skipped, just not locally.
+- Setting `PageSize` without a `PagingClauseTemplate` throws `InvalidOperationException` rather than
+  silently running unpaged.
+- Paging docs corrected: paging costs *more* total server work, not less. `OFFSET n` is not a seek,
+  so a full walk scans roughly `N² / (2 × PageSize)` rows. The previous claim that paging avoids
+  "streaming everything to the client" was never true — extraction streams off a `DbDataReader`
+  either way. What paging buys is bounded per-query work, shorter transactions and resumability.
 
 ### Deprecated
 
+- `ServerOffset` now forwards to `SkipItemCount` — the two were always the same idea, so there is
+  one value rather than two that can disagree. Out-of-`int` values throw rather than truncating.
+- `ServerLimit` now forwards to `PageSize`. **Its meaning changed** from "total rows to return" to
+  "rows per round-trip"; use `MaximumItemCount` for the total. Renamed rather than reused so the
+  change surfaces at the call site instead of silently returning a different number of rows.
+
 ### Removed
+
+- The `ServerOffset`-without-`ServerLimit` error. An offset no longer needs a page size, because it
+  is now just `SkipItemCount`.
 
 ### Fixed
 

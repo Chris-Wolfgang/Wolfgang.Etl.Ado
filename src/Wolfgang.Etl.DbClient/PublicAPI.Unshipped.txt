@@ -1,1 +1,8 @@
 #nullable enable
+Wolfgang.Etl.DbClient.DbExtractor<TRecord>.PageSize.get -> int?
+Wolfgang.Etl.DbClient.DbExtractor<TRecord>.PageSize.set -> void
+Wolfgang.Etl.DbClient.DbExtractorOptions.PageSize.get -> int?
+Wolfgang.Etl.DbClient.DbExtractorOptions.PageSize.init -> void
+Wolfgang.Etl.DbClient.IDbExtractorBuilder<T>.MaximumItemCount(int maximum) -> Wolfgang.Etl.DbClient.IDbExtractorBuilder<T>!
+Wolfgang.Etl.DbClient.IDbExtractorBuilder<T>.PageSize(int? pageSize) -> Wolfgang.Etl.DbClient.IDbExtractorBuilder<T>!
+Wolfgang.Etl.DbClient.IDbExtractorBuilder<T>.SkipItemCount(int skip) -> Wolfgang.Etl.DbClient.IDbExtractorBuilder<T>!

@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Data;
 using Microsoft.Data.Sqlite;
@@ -130,7 +130,7 @@ public class EtlParameterSetDirectTests
         var ex = Assert.Throws<InvalidOperationException>(() => sut.Add("@PageOffset", 0L));
 
         Assert.Contains("@PageOffset", ex.Message, StringComparison.Ordinal);
-        Assert.Contains("ServerLimit", ex.Message, StringComparison.Ordinal);
+        Assert.Contains("PagingClauseTemplate", ex.Message, StringComparison.Ordinal);
     }
 
 

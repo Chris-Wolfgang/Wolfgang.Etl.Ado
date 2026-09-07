@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Threading;
@@ -83,6 +83,33 @@ internal sealed class DbExtractorBuilder<T> : IDbExtractorBuilder<T>
 
 
 
+    public IDbExtractorBuilder<T> PageSize(int? pageSize)
+    {
+        _extractor.PageSize = pageSize;
+        return this;
+    }
+
+
+
+    /// <inheritdoc/>
+    public IDbExtractorBuilder<T> SkipItemCount(int skip)
+    {
+        _extractor.SkipItemCount = skip;
+        return this;
+    }
+
+
+
+    /// <inheritdoc/>
+    public IDbExtractorBuilder<T> MaximumItemCount(int maximum)
+    {
+        _extractor.MaximumItemCount = maximum;
+        return this;
+    }
+
+
+
+    /// <inheritdoc/>
     public IDbExtractorBuilder<T> ServerLimit(long? limit)
     {
         _extractor.ServerLimit = limit;
