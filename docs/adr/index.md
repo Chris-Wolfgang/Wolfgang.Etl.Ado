@@ -9,6 +9,7 @@ New ADRs land alongside the PR that introduces the decision; the ADR is part of 
 | ID | Title | Status | Date |
 |---|---|---|---|
 | [0001](0001-source-generator-ships-in-runtime-nuget.md) | Source generator ships in the runtime NuGet, not as a separate package | Accepted | 2026-07-01 |
+| [0002](0002-skip-max-and-paging.md) | Skip and Max are the contract; paging is transport tuning | Proposed | 2026-09-07 |
 
 ## Statuses
 
